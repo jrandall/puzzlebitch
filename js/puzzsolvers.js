@@ -1,105 +1,243 @@
 
 define([
-     "../js/pb-meteor-rest-client.js",
-     "dojo/parser", 
-     "dojo/_base/connect",
-     "dijit/Dialog", 
-     "dijit/form/Button", 
-     "dijit/form/TextBox",
-	 "dojo/dnd/Source",
-	 "dojo/topic",
-     "dojo/dom",
-	 "dojo/dom-construct",
-     "dojo/domReady!",
-     ], 
-    function(pbmrc, parser, connect, dialog, formbutton, formtextbox, Source, topic, dom, domConstruct, domready) {
+	   "../js/pb-meteor-rest-client.js",
+	   "dojo/parser", 
+	   "dojo/_base/connect",
+	   "dojo/_base/lang",
+	   "dojo/_base/array",
+	   "dojo/_base/window",
+	   "dijit/Dialog", 
+	   "dijit/form/Button", 
+	   "dojo/dnd/Source",
+	   "dojo/topic",
+	   "dojo/dom",
+	   "dojo/dom-construct",
+	   "dojo/dom-style",
+	   "dojo/domReady!",
+       ], 
+    function(pbmrc, parser, connect, lang, array, win, dialog, formbutton, Source, topic, dom, domconstruct, domstyle) {
 
 	var puzzstore; // IFWS which will be returned from pbmrc.pb_init()
 	var solverstore; // IFWS which will be returned from pbmrc.pb_init()
 	var update_solver_store; // function which will be returned from pbmrc.pb_init()
 	
-	var puzzBoxes = new Array();
-	var puzzBoxDivs = new Array();
-	var waitDiv;
+	var add_solver_ui_handler_connection;
+	var remove_solver_ui_handler_connection;
+	var update_solver_ui_handler_connection;
+	var add_puzz_ui_handler_connection;
+	var remove_puzz_ui_handler_connection;
+	var update_puzz_ui_handler_connection;
+	
+	var poolBox;
+	var puzzBoxes;
 	var status_button;
 	var meteor_status;
 	var meteor_mode;
-	var my_editable;
 
 	var solved_answer_filter='*';
 	
 	var roundlist = new Array();
 	roundlist.push("All");
-	
+
+	//disable copying from Sources (i.e. only allow move)
+	lang.extend(Source, {copyState: function(keyPressed,self) {return false;}});
+
 	function init_complete_cb() {
-	    pbmrc.pb_log("init_complete_cb()");	
 	    // remove the little waitDiv notice
-	    dom.byId("puzzlecontainer").removeChild(waitDiv);
-		var poolBox = new Source(dom.byId("poolcontainer"));
-		add_puzzle_boxes();
+	    win.body().removeChild(dom.byId("waitDiv"));
+	    poolBox = new Source(dom.byId("poolcontainer"));
+	    poolBox.singular=true;
+	    //hooks up our listeners
+	    pbmrc.pb_log("init_complete_cb(): enabling connection handlers");
+	    enable_store_ui_handlers();
+	    
+	    pbmrc.pb_log("init_complete_cb(): adding puzzleboxes");
+	    puzzBoxes = new Array(); 
+		puzzstore.fetch({
+			onItem: function(item){
+				puzzBoxes[puzzstore.getValue(item,"name")] = new Source(create_puzzle_node(item));
+				puzzBoxes[puzzstore.getValue(item,"name")].singular=true;
+				var node = puzzBoxes[puzzstore.getValue(item,"name")].node;
+				if (puzzstore.getValue(item,"answer") != "" && puzzstore.getValue(item,"status") == "Solved"){
+					//this puzzle is already solved, so hide it.
+					domstyle.set(node, "display", "none");	
+				}
+				dom.byId("puzzles_layout").appendChild(node);
+			}
+		});
+	    
+		pbmrc.pb_log("init_complete_cb(): adding solvers");
 		solverstore.fetch({
 			onItem: function(item){
-				if (item.puzz == ""){
-					poolBox.insertNodes(false,item.id);
+				var node = create_solver_node(item);
+				if (solverstore.getValue(item,"puzz") == ""){
+					poolBox.insertNodes(false,[node]);
 				}else{
-					puzzBoxes[item.puzz].insertNodes(false,item.id);
+					var box = puzzBoxes[solverstore.getValue(item,"puzz")];
+					if (box){
+						box.insertNodes(false,[node]);
+					}else{
+						poolBox.insertNodes(false,[node]);
+					}
 				}
-		 	}
-		 });
+			}
+		});
+	    pbmrc.pb_log("init_complete_cb(): init complete");
+	}
+	
+	function enable_store_ui_handlers(){
+		add_solver_ui_handler_connection = connect.connect(solverstore,"onNew",add_solver_ui);
+		remove_solver_ui_handler_connection = connect.connect(solverstore,"onDelete",remove_solver_ui);
+		update_solver_ui_handler_connection = connect.connect(solverstore,"onSet",update_solver_ui);
+		add_puzz_ui_handler_connection = connect.connect(puzzstore,"onNew",add_puzz_ui);
+		remove_puzz_ui_handler_connection = connect.connect(puzzstore,"onDelete",remove_puzz_ui);
+		update_puzz_ui_handler_connection = connect.connect(puzzstore,"onSet",update_puzz_ui);
+	}
+	
+	function disable_store_ui_handlers(){
+		connect.disconnect(add_solver_ui_handler_connection);
+		connect.disconnect(remove_solver_ui_handler_connection);
+		connect.disconnect(update_solver_ui_handler_connection);
+		connect.disconnect(add_puzz_ui_handler_connection);
+		connect.disconnect(remove_puzz_ui_handler_connection);
+		connect.disconnect(update_puzz_ui_handler_connection);
+	}
+	
+	function create_solver_node(item){
+		return domconstruct.create("div", {class: "solver", id: "solver_div_"+solverstore.getValue(item,"name"), innerHTML: solverstore.getValue(item,"name")});
+	}
+	
+	function create_puzzle_node(item){
+	    return domconstruct.create("div", {class: "puzzle_container", id: "puzzle_div_"+puzzstore.getValue(item,"name"), innerHTML: puzzstore.getValue(item,"name")});
 	}
 	
 	function dropped_on_puzz(source, nodes, copy, target){
-		update_solver_store(nodes[0].innerHTML,target.node.id);
-		//Note that this only works if there's exactly one node being dnd'd. 
-		//perhaps our interface should be restricted to moving one at a time?
+	    //note this only works if we move one at a time (hence Source.singular is set)
+	    var moved_node_name = nodes[0].id;
+	    var splitsolver = moved_node_name.split('_');
+	    var solver = splitsolver[2];
+		
+	    //need to translate target source name to DB puzzle name
+	    var target_source_name = target.node.id;
+	    var puzz;
+	    if (target_source_name == "poolcontainer"){
+		//the null puzzle
+		puzz = "";
+	    }else{
+		var splitpuzz = target_source_name.split('_');
+		puzz = splitpuzz[2];
+	    }
+
+		pbmrc.pb_log("dropped_on_puzz(): solver "+solver+" dropped on "+puzz);
+		// update client's changes in the store.
+		solverstore.fetchItemByIdentity({
+			identity: solver,
+			onItem: function(item) {
+				disable_store_ui_handlers()
+				solverstore.setValue(item,"puzz",puzz);
+				solverstore.save({onError: error_cb});
+				enable_store_ui_handlers()
+			}
+		});
+	}
+	
+	function add_solver_ui(item, parentinfo){		
+		pbmrc.pb_log("add_solver_ui()");
+		if (solverstore.getValue(item,"puzz") == ""){
+			var node = create_solver_node(item);
+			poolBox.insertNodes(false,[node]);
+		}else{
+			error_cb("Solver "+solverstore.getValue(item,"name")+" was added, but is already working on a puzzle?!");
+		}
+	}
+	
+	function remove_solver_ui(item){
+		pbmrc.pb_log("remove_solver_ui()");
+		
+		if (solverstore.getValue(item,"puzz")==""){
+			poolBox.delItem(solverstore.getValue(item,"name"))
+		}else{
+			puzzBoxes[solverstore.getValue(item,"puzz")].delItem(solverstore.getValue(item,"name"));
+		}
+	}
+	
+	function update_solver_ui(item, attribute, oldValue, newValue){
+		pbmrc.pb_log("update_solver_ui(): name="+solverstore.getValue(item,"name")+" attribute="+attribute+" oldValue="+oldValue+" newValue="+newValue);
+		if (attribute == "puzz"){
+			if (newValue == ""){
+			    poolBox.insertNodes(false,[dom.byId("solver_div_"+solverstore.getValue(item,"name"))]);
+			    poolBox.sync();				
+			}else{
+				puzzBoxes[newValue].insertNodes(false, [dom.byId("solver_div_"+solverstore.getValue(item,"name"))]);
+				puzzBoxes[newValue].sync();
+			}
+			if (oldValue == ""){
+				poolBox.delItem("solver_div_"+solverstore.getValue(item,"name"));
+				poolBox.sync();
+			}else{
+				puzzBoxes[oldValue].delItem("solver_div_"+solverstore.getValue(item,"name"));
+				puzzBoxes[oldValue].sync();
+			}
+		}
+	}
+	
+	function add_puzz_ui(item, parentinfo){
+		pbmrc.pb_log("add_puzz_ui()");
+		
+		if (puzzstore.getValue(item,"answer") == "" || puzzstore.getValue(item,"status") != "Solved"){
+		    puzzBoxes[puzzstore.getValue(item,"name")] = new Source(create_puzzle_node(item));					
+		    puzzBoxes[puzzstore.getValue(item,"name")].singular = true;
+		    dom.byId("puzzles_layout").appendChild(puzzBoxes[puzzstore.getValue(item,"name")].node);
+		}
+	}
+	
+	function remove_puzz_ui(item){
+	    pbmrc.pb_log("remove_puzz_ui()");
+	    dom.byId("puzzles_layout").removeChild(puzzBoxes[puzzstore.getValue(item,"name")].node);
+	    pbmrc.pb_log("successfully removed node");
+	}
+	
+	function update_puzz_ui(item, attribute, oldValue, newValue){
+		pbmrc.pb_log("update_puzz_ui(): name="+puzzstore.getValue(item,"name")+" attribute="+attribute+" oldValue="+oldValue+" newValue="+newValue);
+		if ((attribute == "status" && newValue == "Solved" && puzzstore.getValue(item,"answer") != "" && oldValue != "Solved")||
+		    (attribute == "answer" && newValue != "" && oldValue == "" && puzzstore.getValue(item,"status") == "Solved")){
+		    //this represents a puzzle switched to solved, and with a non-null answer
+		    domstyle.set(puzzBoxes[puzzstore.getValue(item,"name")].node, "display", "none");
+		}else if((attribute == "status" && oldValue == "Solved" && newValue != "Solved") ||
+			 (attribute == "answer" && oldValue != "" && newValue == "")){
+		    //this represents a puzzle switched from solved to unsolved
+		    domstyle.set(puzzBoxes[puzzstore.getValue(item,"name")].node, "display", "block");
+		}
 	}
 	
 	function roundlist_update_cb(my_roundlist) {
-	    //don't care.
+		//don't care.
 	}
 	
 	function add_round_cb(roundname) {
 		//don't care.
 	}
-	
-	function add_puzzle_boxes(){
-		pbmrc.pb_log("add_puzzle_boxes(): adding puzzle boxes");
-		puzzBoxDivs = new Array();
-		puzzBoxes = new Array(); 
-		puzzstore.fetch({
-			onItem: function(item){
-				if (item.answer == ""){
-					puzzBoxDivs[item.id] = domConstruct.create("div", {class: "container", id: item.id});
-					puzzBoxDivs[item.id].appendChild(domConstruct.create("p",{innerHTML: item.id}));
-					puzzBoxes[item.id] = new Source(puzzBoxDivs[item.id]);					
-					dom.byId("puzzlecontainer").appendChild(puzzBoxDivs[item.id]);
-				}
-			}
-		});
-	}
+
 	
 	function puzzle_update_cb() {
-		pbmrc.pb_log("puzzle_update_cb()");
-		//we delete any div that belongs to a solved puzzle.
-		for (var i in puzzBoxDivs){
-			dom.byId("puzzlecontainer").removeChild(puzzBoxDivs[i]);
-		}
-		add_puzzle_boxes();
-		
-	    //pbmrc.pb_log("puzzle_update_cb");
-	    //pbmrc.pb_log("puzzle_update_cb: applying round filters");	
-	    //apply_round_filters();
+		pbmrc.pb_log("puzzle_update_cb(): does nothing.",2);
 	}
 	
-	function puzzle_part_update_cb(puzzle, key, value) {
-	    pbmrc.pb_log("puzzle_part_update_cb: puzzle="+puzzle+" key="+key+" value="+value);
+	function solver_update_cb(){
+		pbmrc.pb_log("solver_update_cb(): does nothing.",2);
 	}
 	
+	
+	function received_updated_part_cb(store, appid, key, value) {
+	    pbmrc.pb_log("received_updated_part_cb: store="+store+" appid="+appid+" key="+key+" value="+value);
+	}
+
+
 	function error_cb(msg) {
-	    dom.byId("puzzlecontainer").removeChild(waitDiv);
-		dom.byId("puzzlecontainer").appendChild(domConstruct.create("p",{innerHTML: "I'm sorry, a catastrophic error occurred: "}));
-		dom.byId("puzzlecontainer").appendChild(domConstruct.create("p",{innerHTML: msg}));
-		dom.byId("puzzlecontainer").appendChild(domConstruct.create("p",{innerHTML: "Perhaps jcrandall@alum.mit.edu or jcbarret@alum.mit.edu could help?"}));
+	    win.body().removeChild(dom.byId("waitDiv"));
+		win.body().appendChild(domconstruct.create("p",{innerHTML: "I'm sorry, a catastrophic error occurred: "}));
+		win.body().appendChild(domconstruct.create("p",{innerHTML: msg}));
+		win.body().appendChild(domconstruct.create("p",{innerHTML: "Perhaps jcrandall@alum.mit.edu or jcbarret@alum.mit.edu could help?"}));
 	}
 	
 	function warning_cb(msg) {
@@ -177,45 +315,25 @@ define([
 	    }    
 	}
 	
-	function _display_all(){
-		for (var i in roundlist){
-			var roundname = roundlist[i];
-			if (roundname != "All"){
-				tpdivs[roundname].style.display = 'none';
-			}else{
-				tpdivs[roundname].style.display = 'block';
-			}
-		}
-	}
-	
-	
-	function _updateRoundsVsAll(){
-		var toggled = dom.byId("roundsvsall").checked;
-		if (toggled == true){
-			 pbmrc.pb_log("displaying rounds");
-			_display_rounds();
-		}else{
-			 pbmrc.pb_log("displaying all");
-			_display_all();
-		}
+	var is_addpuzzle_patt = /^puzzles\/[^\/]*\/$/;
+	var is_answerstatus_patt = /^puzzles\/[^\/]*\/(answer|status)$/;
+	var is_solvers_patt = /^solvers/;
+	var is_any_version_patt = /^version/;
+
+	function version_diff_filter(diff){
+	    // N.B. all pbmrcs must listen to version!
+	    pbmrc.pb_log("version_diff_filter()")
+	    return array.filter(diff, function(item){
+				    return (is_any_version_patt.test(item) ||
+					    is_addpuzzle_patt.test(item) || 
+					    is_solvers_patt.test(item) || 
+					    is_answerstatus_patt.test(item));
+				});
 	}
 	
 	return {
-		updateHideSolved: function() {
-			_updateHideSolved();
-		},
-
-		updateRoundsVsAll: function(){
-			_updateRoundsVsAll();
-		},
 		
-		my_init: function(editable) {
-			my_editable = editable;
-			pbmrc.pb_log("my_init()");
-			//please wait
-			waitDiv = domConstruct.create("div")
-			waitDiv.innerHTML="<b>Please wait, while data loads. (This could take a while!)</b></br>";
-			dom.byId("puzzlecontainer").appendChild(waitDiv);
+		my_init: function() {
 	    
 			pbmrc.pb_log("my_init: creating status indicator / button");
 			status_button = new formbutton({
@@ -228,11 +346,12 @@ define([
 			dom.byId("statuscontainer").appendChild(status_button.domNode);
 	    
 			pbmrc.pb_log("my_init: calling pbmrc.pb_init");
-		        var ret = pbmrc.pb_init(init_complete_cb, roundlist_update_cb, add_round_cb, puzzle_update_cb, puzzle_part_update_cb, error_cb, warning_cb, 
-				meteor_conn_status_cb, meteor_conn_mode_cb);
-		        puzzstore = ret.puzzstore;
-		        solverstore = ret.solverstore;
-		        update_solver_store = ret.update_solverstore;
+		    var ret = pbmrc.pb_init(init_complete_cb, add_round_cb, 
+				puzzle_update_cb, received_updated_part_cb, solver_update_cb, 
+				error_cb, warning_cb, meteor_conn_status_cb, meteor_conn_mode_cb,version_diff_filter);
+				
+		    puzzstore = ret.puzzstore;
+		    solverstore = ret.solverstore;
 			topic.subscribe("/dnd/drop",dropped_on_puzz);
 		},	
 	};

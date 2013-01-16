@@ -7,6 +7,7 @@ use Scalar::Util qw(tainted looks_like_number);
 use PB::Config;
 use PB::Meteor;
 use PB::TWiki;
+use PB::BigJimmy;
 
 use Net::LDAP;
 
@@ -162,12 +163,16 @@ sub _add_puzzle_db {
     my $uri = shift;
     my $gssuri = shift;
 
+    # convert gssuri to null (undef) if not set
+    if($gssuri eq '') {
+	$gssuri = undef;
+    }
     my $sql = "INSERT INTO `puzzle` (`name`, `round_id`, `puzzle_uri`, `drive_uri`, `status`) VALUES (?, (SELECT id FROM `round` WHERE `round`.`name`=?), ?, ?, 'New');";
     my $c = $dbh->do($sql, undef, $id, $round, $uri, $gssuri);
     
     if(defined($c)) {
 	debug_log("_add_puzzle_db: dbh->do returned $c\n",2);
-	_send_meteor_version();
+	_send_data_version();
 	return(1);
     } else {
 	debug_log("_add_puzzle_db: dbh->do returned error: ".$dbh->errstr."\n",0);
@@ -184,21 +189,22 @@ sub _add_puzzle_google {
 
     # create google spreadsheet for this puzzle
     debug_log("add_puzzle: creating google spreadsheet\n",0);
-    my $google = google_create_spreadsheet($id, $round, $PB::Config::TWIKI_WEB, $PB::Config::TWIKI_URI."/twiki/bin/view/".$PB::Config::TWIKI_WEB."/".$puzzletopic, $uri);
+    my $google = _google_create_spreadsheet($id, $round, $PB::Config::TWIKI_WEB, $PB::Config::TWIKI_URI."/twiki/bin/view/".$PB::Config::TWIKI_WEB."/".$puzzletopic, $uri);
     my $gssuri = $google->{'spreadsheet'};
     debug_log("add_puzzle: have google spreadsheet $gssuri\n",0);
     my $folderuri = $google->{'subfolder'};
     debug_log("add_puzzle: have google folder $folderuri\n",0);
     
     # create google document for this puzzle
-    debug_log("add_puzzle: creating google document\n",0);
-    $google = google_create_document($id, $round, $PB::Config::TWIKI_WEB);
-    my $gduri = $google->{'document'};
-    debug_log("add_puzzle: have google document $gduri\n",0);
-    my $gdfolderuri = $google->{'subfolder'};
-    debug_log("add_puzzle: have google folder $gdfolderuri\n",0);
+    #debug_log("add_puzzle: creating google document\n",0);
+    #$google = _google_create_document($id, $round, $PB::Config::TWIKI_WEB);
+    #my $gduri = $google->{'document'};
+    #debug_log("add_puzzle: have google document $gduri\n",0);
+    #my $gdfolderuri = $google->{'subfolder'};
+    #debug_log("add_puzzle: have google folder $gdfolderuri\n",0);
 
     # TODO update URI in data store
+    return $gssuri;
 }
 
 sub _add_puzzle_twiki {
@@ -255,9 +261,21 @@ sub add_puzzle {
 
     debug_log("add_puzzle()\n",2);
 
+    # Figure out what names of TWiki topics should be
+    my $puzzletopic = $id."Puzzle";
+    my $roundtopic = $round."Round";
+    if(!defined($templatetopic) || $templatetopic eq "") {
+	$templatetopic = "GenericPuzzleTopicTemplate";
+    }
+    
+    #_add_puzzle_twiki($id, $round, $uri, $templatetopic, $puzzletopic, $roundtopic);
+    #my $gssuri = _add_puzzle_google($id, $round, $uri, $templatetopic, $puzzletopic);
+    my $gssuri = "";
+
+
     # Add to backend data store files
     if($PB::Config::PB_DATA_WRITE_FILES > 0) {
-	if(_add_puzzle_files($id, $round, $uri, "") <= 0) {
+	if(_add_puzzle_files($id, $round, $uri, $gssuri) <= 0) {
 	    debug_log("add_puzzle: Can't write fields for puzzle data!!\n",0);
 	    return(-1);
 	}
@@ -265,21 +283,11 @@ sub add_puzzle {
     
     # Add to database
     if($PB::Config::PB_DATA_WRITE_DB > 0) {
-	if(_add_puzzle_db($id, $round, $uri, "") <= 0) {
+	if(_add_puzzle_db($id, $round, $uri, $gssuri) <= 0) {
 	    debug_log("add_puzzle: couldn't add to db!\n",0);
 	    return(-101);
 	}
     }    
-    
-    # Figure out what names of TWiki topics should be
-    my $puzzletopic = $id."Puzzle";
-    my $roundtopic = $round."Round";
-    if($templatetopic eq "") {
-	$templatetopic = "GenericPuzzleTopicTemplate";
-    }
-    
-    #_add_puzzle_twiki($id, $round, $uri, $templatetopic, $puzzletopic, $roundtopic);
-    #_add_puzzle_google($id, $round, $uri, $templatetopic, $puzzletopic);
     
     return 0; # success
 }
@@ -402,6 +410,23 @@ sub _google_create_document {
     return(\%output);
 }
 
+sub puzzle_solved {
+    my $idin = shift;
+    debug_log("puzzle_solved():  $idin has been solved\n", 5);
+
+    #We want to send off notifications to users still tooling on this puzzle
+    #Also perhaps to watercooler?
+    #TODO: UNIMPLEMENTED!
+    
+    #We want to send solvers working on this puzzle to the pool.
+    my $puzzref = get_puzzle($idin);
+    my @cursolvers = split(",", $puzzref->{"cursolvers"});
+    foreach my $solver (@cursolvers){
+	assign_solver_puzzle("", $solver);
+    }
+    
+}
+
 
 sub get_puzzle {
     my $idin = shift;
@@ -522,6 +547,7 @@ sub _get_puzzles_files {
 	    }
 	    my %puzzle = (
 		id => $id,
+		name => $id,
 		linkid => "<a href=\"$uri\" target=\"$id\">$id</a>",
 		round => $round,
 		uri => $uri,
@@ -569,11 +595,14 @@ sub _get_puzzle_db {
     my $res;
     my $sql = 'SELECT * FROM `puzzle_view`';
     my $sth;
+    my $always_return_array = 0;
+    #This fixes problem with type error when there is exactly one puzzle in the DB.
     if ($idin eq '*') {
+	$always_return_array = 1;
 	$sth  = $dbh->prepare($sql);
 	$sth->execute() or die $dbh->errstr;;
     } else {
-        $sql .= ' WHERE (`id` REGEXP ?)';
+        $sql .= ' WHERE (`name` REGEXP ?)';
 	$sth = $dbh->prepare($sql);
 	$sth->execute('^'.$idin.'$');
     }
@@ -586,7 +615,7 @@ sub _get_puzzle_db {
 	}
 	push @rows, $res;
     }
-    if(@rows > 1) {
+    if($always_return_array > 0 || @rows > 1) {
 	return \@rows;
     } else {
 	return \%{$rows[0]};
@@ -594,23 +623,42 @@ sub _get_puzzle_db {
 }
 
 sub update_puzzle_part {
-    my $id = shift;
-    my $part = shift;
-    my $val = shift;
+	my $id = shift;
+	my $part = shift;
+	my $val = shift;
 
-    if($PB::Config::PB_DATA_WRITE_FILES > 0) {
-	my $rval = _update_puzzle_part_files($id, $part, $val);
-	if(looks_like_number($rval) && $rval < 0) {
-	    return $rval;
+	#We need special handling for a puzzle part update which imples the puzzle is solved
+	#This might be either a status change to "Solved", or an answer change to non-null
+	#Our accepted logic, system wide, is that only both of these things represent a solved puzzle
+	
+	if ($part eq "status" && $val eq "Solved"){
+	    #is there an answer?
+	    my $puzzref = get_puzzle($id);
+	    if ($puzzref->{"answer"} ne ""){
+		puzzle_solved($id);
+	    }
+	}elsif ($part eq "answer" && $val ne ""){
+	    #am I solved status?
+	    my $puzzref = get_puzzle($id);
+	    if ($puzzref->{"status"} eq "Solved"){
+		puzzle_solved($id);
+	    }
 	}
-    }
+
+
+	if($PB::Config::PB_DATA_WRITE_FILES > 0) {
+		my $rval = _update_puzzle_part_files($id, $part, $val);
+		if(looks_like_number($rval) && $rval < 0) {
+			return $rval;
+		}
+	}
     
-    if($PB::Config::PB_DATA_WRITE_DB > 0) {
-	my $rval = _update_puzzle_part_db($id, $part, $val);
-	if($rval < 0) {
-	    return $rval;
+	if($PB::Config::PB_DATA_WRITE_DB > 0) {
+		my $rval = _update_puzzle_part_db($id, $part, $val);
+		if(looks_like_number($rval) && $rval < 0) {
+			return $rval;
+		}
 	}
-    }
 }
 
 sub _update_puzzle_part_files {
@@ -631,27 +679,18 @@ sub _update_puzzle_part_files {
     }
 }
 
-sub _send_meteor_version {
-    my $dataversion = _get_log_index_db();
-    if(PB::Meteor::message($PB::Config::METEOR_VERSION_CHANNEL, $dataversion) <= 0) {
-	debug_log("PB::API::_send_meteor_version() sending version $dataversion over meteor\n",0);
-	return -1;
-    }
-    return 1;
-}
-
 sub _update_puzzle_part_db {
     my $id = shift;
     my $part = shift;
     my $val = shift;
 
     # TODO: fix SQL injection attack vector through $part
-    my $sql = 'UPDATE `puzzle_view` SET `'.$part.'` = ? WHERE `id` LIKE ? LIMIT 1';
+    my $sql = 'UPDATE `puzzle_view` SET `'.$part.'` = ? WHERE `name` LIKE ? LIMIT 1';
     my $c = $dbh->do($sql, undef, $val, $id);
     
     if(defined($c)) {
 	debug_log("_update_puzzle_part_db: id=$id part=$part val=$val dbh->do returned $c\n",2);
-	_send_meteor_version();
+	_send_data_version();
 	return(1);
     } else {
 	debug_log("_update_puzzle_part_db: id=$id part=$part val=$val dbh->do returned error: ".$dbh->errstr."\n",0);
@@ -921,7 +960,7 @@ sub _add_round_db {
     
     if(defined($c)) {
 	debug_log("_add_round_db: dbh->do returned $c\n",2);
-	_send_meteor_version();
+	_send_data_version();
 	return(1);
     } else {
 	debug_log("_add_round_db: dbh->do returned error: ".$dbh->errstr."\n",0);
@@ -969,50 +1008,52 @@ sub _add_round_twiki {
 }
 
 sub add_round {
-    my $new_round = shift;
-    #clean up input
-    $new_round =~ s/^.+\:\ //g;
-    $new_round =~ s/\W//g;
-    $new_round =~ s/\-/Dash/g;
-    $new_round =~ s/\_/Underscore/g;
-    $new_round =~ s/\ //g;
+	my $new_round = shift;
+	#clean up input
+	$new_round =~ s/^.+\:\ //g;
+	$new_round =~ s/\W//g;
+	$new_round =~ s/\-/Dash/g;
+	$new_round =~ s/\_/Underscore/g;
+	$new_round =~ s/\ //g;
 
-    # untaint new_round
-    if($new_round =~ /^([A-Z][[:alnum:]]+)$/ ) {
-	$new_round = $1;
-    } else {
-	debug_log("add_round: new_round did not pass security checks ($new_round)\n",1);
-	return(-4);
-    }
-
-    my $gfuri = "";
-#    $gfuri = _google_create_round($new_round, $PB::Config::TWIKI_WEB);
-#    debug_log("add_round: have google folder $gfuri\n",0);
-    
-    my $roundtopic = $new_round."Round";
-#    my $rval=_add_round_twiki($new_round, $roundtopic, $gfuri);
-#    if($rval < 0) {
-#	debug_log("add_round: error adding round to twiki: $rval\n",0);
-#	return $rval;
-#    }
-
-    if($PB::Config::PB_DATA_WRITE_FILES > 0) {
-	my $rval = _add_round_files($new_round);
-	if($rval < 0) {
-	    return $rval;
+	# untaint new_round
+	if($new_round =~ /^([[:alnum:]]+)$/ ) {
+		$new_round = $1;
+	} else {
+		debug_log("add_round: new_round did not pass security checks ($new_round)\n",1);
+		return(-4);
 	}
-    }
+
+	my $gfuri = "";
+	#    $gfuri = _google_create_round($new_round, $PB::Config::TWIKI_WEB);
+	#    debug_log("add_round: have google folder $gfuri\n",0);
     
-    if($PB::Config::PB_DATA_WRITE_DB > 0) {
-	my $rval = _add_round_db($new_round);
-	if($rval < 0) {
-	    return $rval;
+	my $roundtopic = $new_round."Round";
+	#    my $rval=_add_round_twiki($new_round, $roundtopic, $gfuri);
+	#    if($rval < 0) {
+	#	debug_log("add_round: error adding round to twiki: $rval\n",0);
+	#	return $rval;
+	#    }
+
+	if($PB::Config::PB_DATA_WRITE_FILES > 0) {
+		my $rval = _add_round_files($new_round);
+		if($rval < 0) {
+			return $rval;
+		}
 	}
-    }
     
-    _write_log_files("rounds:$remoteuser added round $new_round");
-    # add round to roundlist
-    return(_twiki_update_roundlist($roundtopic));
+	if($PB::Config::PB_DATA_WRITE_DB > 0) {
+		my $rval = _add_round_db($new_round);
+		if($rval < 0) {
+			return $rval;
+		}
+	}
+    
+	_write_log_files("rounds:$remoteuser added round $new_round");
+	# add round to roundlist
+	#my $rval = _twiki_update_roundlist($roundtopic);
+	#return($rval);
+	return 0; # success
 }
 
 ##########
@@ -1020,173 +1061,279 @@ sub add_round {
 ##########
 
 sub get_template_list {
-    debug_log("get_template_list\n",6);
-    my @templates;
-    chdir $PB::Config::TWIKI_DATA_PATH.'/'.$PB::Config::TWIKI_WEB;
-    open FILE, "ls *PuzzleTopicTemplate.txt|";
-#    open FILE, $PB::Config::TEMPLATES_FILE;
-#    flock FILE, $EXCLUSIVE_LOCK;
-    while (<FILE>){
-	chomp;
-	s/\.txt$//;
-	push @templates, $_;
-    }
-#    flock FILE, $UNLOCK;
-    close FILE;
+	debug_log("get_template_list\n",6);
+	my @templates;
+	chdir $PB::Config::TWIKI_DATA_PATH.'/'.$PB::Config::TWIKI_WEB;
+	open FILE, "ls *PuzzleTopicTemplate.txt|";
+	#    open FILE, $PB::Config::TEMPLATES_FILE;
+	#    flock FILE, $EXCLUSIVE_LOCK;
+	while (<FILE>){
+		chomp;
+		s/\.txt$//;
+		push @templates, $_;
+	}
+	#    flock FILE, $UNLOCK;
+	close FILE;
         
-    return @templates;
+	return @templates;
 }
 
 ##############
 #SOLVERS/USERS
 ##############
 
-sub ldap_add_user {
-    my $username = shift;
-    my $firstname = shift;
-    my $lastname = shift;
-    my $email = shift;
-    my $password = shift;
+sub get_solver_list {
+	if($PB::Config::PB_DATA_READ_DB_OR_FILES eq "FILES") {
+		return ldap_get_user_list();
+	} else {
+		return _get_solver_list_db();
+	}
+}
+
+sub _get_solver_list_db {
+	my $sql = 'SELECT `name` FROM `solver_view`';
+	my $res = $dbh->selectcol_arrayref($sql);
+	return $res;
+}
+
+sub get_solver {
+	my $idin = shift;
+	chomp $idin;
     
-    my $ldap = Net::LDAP->new(  "$PB::Config::REGISTER_LDAP_HOST" );
-    # bind to a directory with dn and password
-    my $mesg = $ldap->bind( "cn=$PB::Config::REGISTER_LDAP_ADMIN_USER,$PB::Config::REGISTER_LDAP_DC",
-			    password => $PB::Config::REGISTER_LDAP_ADMIN_PASS
+	debug_log("get_solver: $idin\n",6);
+
+	if($PB::Config::PB_DATA_READ_DB_OR_FILES eq "FILES") {
+		return _get_solver_files($idin);
+	} else {
+		return _get_solver_db($idin);
+	}
+}
+
+sub _get_solver_files {
+	my $idin = shift;
+	# TODO: actually use files
+	my @solvers;
+	if ($idin eq '*') {
+		foreach my $solver (@{ldap_get_user_list()}) {
+			push @solvers, {id => $solver, name => $solver };
+		}
+	}
+	return \@solvers;
+}
+
+sub _get_solver_db {
+	my $idin = shift;
+
+	my $res;
+	my $sql = 'SELECT * FROM `solver_view`';
+	my $sth;
+	#This fixes problem with type error when there is exactly one solver in the DB.
+	my $always_return_array = 0;
+	if ($idin eq '*') {
+		$always_return_array = 1;
+		$sth  = $dbh->prepare($sql);
+		$sth->execute() or die $dbh->errstr;;
+	} else {
+		$sql .= ' WHERE (`name` REGEXP ?)';
+		$sth = $dbh->prepare($sql);
+		$sth->execute('^'.$idin.'$');
+	}
+	my @rows;
+	while ( my $res = $sth->fetchrow_hashref() ) {
+		foreach my $key (keys %{$res}) {
+			if(!defined($res->{$key})) {
+				$res->{$key} = "";
+			}
+		}
+		push @rows, $res;
+	}
+	if(@rows > 1 || $always_return_array) {
+		return \@rows;
+	} else {
+		return \%{$rows[0]};
+	}
+}
+
+sub add_solver {
+	my $idin = shift;
+	chomp $idin;
+    
+	debug_log("add_solver: $idin\n",6);
+
+	if($PB::Config::PB_DATA_READ_DB_OR_FILES eq "FILES") {
+		return _add_solver_files($idin);
+	} else {
+		return _add_solver_db($idin);
+	}
+}
+
+sub _add_solver_files {
+	my $idin = shift;
+	# NOT IMPLEMENTED
+	return 1;
+}
+
+sub _add_solver_db {
+	my $id = shift;
+
+	my $sql = "INSERT INTO `solver` (`name`) VALUES (?);";
+	my $c = $dbh->do($sql, undef, $id);
+    
+	if(defined($c)) {
+		debug_log("_add_solver_db: dbh->do returned $c\n",2);
+		_send_data_version();
+		return(1);
+	} else {
+		debug_log("_add_solver_db: dbh->do returned error: ".$dbh->errstr."\n",0);
+		return(-1);
+	}
+}
+
+sub ldap_add_user {
+	my $username = shift;
+	my $firstname = shift;
+	my $lastname = shift;
+	my $email = shift;
+	my $password = shift;
+    
+	my $ldap = Net::LDAP->new(  "$PB::Config::REGISTER_LDAP_HOST" );
+	# bind to a directory with dn and password
+	my $mesg = $ldap->bind( "cn=$PB::Config::REGISTER_LDAP_ADMIN_USER,$PB::Config::REGISTER_LDAP_DC",
+	password => $PB::Config::REGISTER_LDAP_ADMIN_PASS
 	);
     
-    my $result = $ldap->add( "uid=$username,ou=people,$PB::Config::REGISTER_LDAP_DC",
-			     attr => [
-				 'objectclass' => [ 'inetOrgPerson' ],
-				 'uid' => $username,
-				 'sn'   => $lastname,
-				 'givenName' => $firstname,
-				 'cn'   => "$firstname $lastname",
-				 'displayName'   => "$firstname $lastname",
-				 'userPassword' => $password,
-				 'email' => $email,
-				 'mail' => $username.'@'.$PB::Config::GOOGLE_DOMAIN,
-				 'o' => $PB::Config::REGISTER_LDAP_O,
-			     ]
+	my $result = $ldap->add( "uid=$username,ou=people,$PB::Config::REGISTER_LDAP_DC",
+	attr => [
+	'objectclass' => [ 'inetOrgPerson' ],
+	'uid' => $username,
+	'sn'   => $lastname,
+	'givenName' => $firstname,
+	'cn'   => "$firstname $lastname",
+	'displayName'   => "$firstname $lastname",
+	'userPassword' => $password,
+	'email' => $email,
+	'mail' => $username.'@'.$PB::Config::GOOGLE_DOMAIN,
+	'o' => $PB::Config::REGISTER_LDAP_O,
+	]
 			     
 	);
     
-    if($result->code() != 0 && !($result->error_desc() =~ m/Already exists/)) {
-	return -1;
-    } 
-    return 0;
+	if($result->code() != 0 && !($result->error_desc() =~ m/Already exists/)) {
+		return -1;
+	} 
+	return 0;
 }
 
 sub google_add_user {
-    my $username = shift;
-    my $firstname = shift;
-    my $lastname = shift;
-    my $password = shift;
-    my $domain = $PB::Config::GOOGLE_DOMAIN;
+	my $username = shift;
+	my $firstname = shift;
+	my $lastname = shift;
+	my $password = shift;
+	my $domain = $PB::Config::GOOGLE_DOMAIN;
 
-    # Backup environment
-    my %ENVBACKUP;
+	# Backup environment
+	my %ENVBACKUP;
 
-    # Kill environment
-    foreach my $var (keys %ENV) {
-	$ENVBACKUP{$var} = delete $ENV{$var};
-    }
-
-    $ENV{JAVA_HOME} = "/usr/java/jdk1.6.0_18";
-    $ENV{CLASSPATH} = ".:$PB::Config::PB_GOOGLE_PATH:/canadia/google/gdata/java/lib/gdata-core-1.0.jar:/canadia/google/gdata/java/lib/gdata-docs-3.0.jar:/canadia/google/gdata/java/lib/gdata-spreadsheet-3.0.jar:/canadia/google/gdata/java/sample/util/lib/sample-util.jar:/canadia/google/commons-cli-1.2/commons-cli-1.2.jar:/canadia/google/javamail-1.4.3/mail.jar:/canadia/google/jaf-1.1.1/activation.jar:/canadia/google/gdata/java/deps/google-collect-1.0-rc1.jar:/canadia/google/gdata/java/deps/jsr305.jar";
-
-    chdir $PB::Config::PB_GOOGLE_PATH;
-
-    print STDERR "Running java from $PB::Config::PB_GOOGLE_PATH\n";
-    # Prepare command
-    my $cmd = "./AddDomainUser.sh --firstname '$firstname' --lastname '$lastname' --username '$username' --password '$password' --domain '$domain' --adminpass $PB::Config::TWIKI_USER_PASS|";
-    my $cmdout="";
-
-    # Execute command
-    if(open ADDPUZZSSPS, $cmd) {
-	# success, check output
-	while(<ADDPUZZSSPS>) {
-	    $cmdout .= $_;
+	# Kill environment
+	foreach my $var (keys %ENV) {
+		$ENVBACKUP{$var} = delete $ENV{$var};
 	}
-    } else {
-	# failure
-	debug_log("_google_add_user: could not open command\n",1);
-	return -100;
-    }
-    close ADDPUZZSSPS;
-    if(($?>>8) != 0) {
-	debug_log("_google_add_user: exit value ".($?>>8)."\n",1);
-	return ($?>>8);
-    }
 
-    # Restore environement
-    foreach(keys %ENVBACKUP) {
-	$ENV{$_} = delete $ENVBACKUP{$_};
-    }
+	$ENV{JAVA_HOME} = "/usr/java/jdk1.6.0_18";
+	$ENV{CLASSPATH} = ".:$PB::Config::PB_GOOGLE_PATH:/canadia/google/gdata/java/lib/gdata-core-1.0.jar:/canadia/google/gdata/java/lib/gdata-docs-3.0.jar:/canadia/google/gdata/java/lib/gdata-spreadsheet-3.0.jar:/canadia/google/gdata/java/sample/util/lib/sample-util.jar:/canadia/google/commons-cli-1.2/commons-cli-1.2.jar:/canadia/google/javamail-1.4.3/mail.jar:/canadia/google/jaf-1.1.1/activation.jar:/canadia/google/gdata/java/deps/google-collect-1.0-rc1.jar:/canadia/google/gdata/java/deps/jsr305.jar";
 
-    return(0);
+	chdir $PB::Config::PB_GOOGLE_PATH;
+
+	print STDERR "Running java from $PB::Config::PB_GOOGLE_PATH\n";
+	# Prepare command
+	my $cmd = "./AddDomainUser.sh --firstname '$firstname' --lastname '$lastname' --username '$username' --password '$password' --domain '$domain' --adminpass $PB::Config::TWIKI_USER_PASS|";
+	my $cmdout="";
+
+	# Execute command
+	if(open ADDPUZZSSPS, $cmd) {
+		# success, check output
+		while(<ADDPUZZSSPS>) {
+			$cmdout .= $_;
+		}
+	} else {
+		# failure
+		debug_log("_google_add_user: could not open command\n",1);
+		return -100;
+	}
+	close ADDPUZZSSPS;
+	if(($?>>8) != 0) {
+		debug_log("_google_add_user: exit value ".($?>>8)."\n",1);
+		return ($?>>8);
+	}
+
+	# Restore environement
+	foreach(keys %ENVBACKUP) {
+		$ENV{$_} = delete $ENVBACKUP{$_};
+	}
+
+	return(0);
 }
 
 
 sub twiki_add_user {
-    my $username = shift;
-    my $firstname = shift;
-    my $lastname = shift;
-    my $email = shift;
-    my $password = shift;
+	my $username = shift;
+	my $firstname = shift;
+	my $lastname = shift;
+	my $email = shift;
+	my $password = shift;
     
-    debug_log("_twiki_add_user()\n",2);
+	debug_log("_twiki_add_user()\n",2);
 
-    # Change dir to twiki
-    chdir $PB::Config::TWIKI_BIN_PATH;
+	# Change dir to twiki
+	chdir $PB::Config::TWIKI_BIN_PATH;
 
-    # Backup environment
-    my %ENVBACKUP;
+	# Backup environment
+	my %ENVBACKUP;
 
-    # Kill environment
-    foreach my $var (keys %ENV) {
-	$ENVBACKUP{$var} = delete $ENV{$var};
-    }
-    
-    # Prepare command
-    my $cmd = "./offlineregister $username $firstname $lastname $email $password |";
-    my $cmdout="";
-
-    # Execute command
-    if(open SAVEPS, $cmd) {
-	# success, check output
-	while(<SAVEPS>) {
-	    $cmdout .= $_;
+	# Kill environment
+	foreach my $var (keys %ENV) {
+		$ENVBACKUP{$var} = delete $ENV{$var};
 	}
-    } else {
-	# failure
-	debug_log("_twiki_add_user: could not open command\n",1);
-	return -1;
-    }
-    close SAVEPS;
-    if(($?>>8) != 0) {
-	debug_log("_twiki_add_user: exit value $?\n",1);
-	return -1;
-    }
+    
+	# Prepare command
+	my $cmd = "./offlineregister $username $firstname $lastname $email $password |";
+	my $cmdout="";
 
-    # Restore environement
-    foreach(keys %ENVBACKUP) {
-	$ENV{$_} = delete $ENVBACKUP{$_};
-    }
+	# Execute command
+	if(open SAVEPS, $cmd) {
+		# success, check output
+		while(<SAVEPS>) {
+			$cmdout .= $_;
+		}
+	} else {
+		# failure
+		debug_log("_twiki_add_user: could not open command\n",1);
+		return -1;
+	}
+	close SAVEPS;
+	if(($?>>8) != 0) {
+		debug_log("_twiki_add_user: exit value $?\n",1);
+		return -1;
+	}
+
+	# Restore environement
+	foreach(keys %ENVBACKUP) {
+		$ENV{$_} = delete $ENVBACKUP{$_};
+	}
 
 
-    # Check for failure
-    if($cmdout =~ m/oops/s) {
-	debug_log("_twiki_add_user: OOPS!\n$cmdout\n",1);
-	return -1;
-    } else {
-	# Success
-	return(0);
-    }
+	# Check for failure
+	if($cmdout =~ m/oops/s) {
+		debug_log("_twiki_add_user: OOPS!\n$cmdout\n",1);
+		return -1;
+	} else {
+		# Success
+		return(0);
+	}
 }
 
-
-sub get_solver_list {
-    debug_log("get_solver_list() using LDAP\n",2);
+sub ldap_get_user_list {
+    debug_log("ldap_get_user_list() using LDAP\n",2);
     
     my $ldap = Net::LDAP->new ("localhost") or die "$@";
     my $mesg = $ldap->search ( base => "ou=people,dc=wind-up-birds,dc=org",
@@ -1204,12 +1351,23 @@ sub get_solver_list {
     
     my @outdata;
     foreach my $d (@sortdata){
-	#my %solver = (id => $d);
-	#push @outdata, \%solver;
 	push @outdata, $d;
     }
     
     return \@outdata;
+}
+
+sub update_solver_part {
+    my $id = shift;
+    my $part = shift;
+    my $val = shift;
+	
+	if ($part eq "puzz"){
+		return assign_solver_puzzle($val,$id);
+	}else{
+		#I don't know who you are.
+		return -7;
+	}
 }
 
 sub assign_solver_puzzle {
@@ -1308,19 +1466,19 @@ sub _assign_solver_puzzle_files {
 }
 
 sub _assign_solver_puzzle_db {    
-    my $puzzname = shift;
-    my $solver = shift;
+	my $puzzname = shift;
+	my $solver = shift;
     
-    my $sql = "INSERT INTO `puzzle_solver` (`puzzle_id`, `solver_id`) VALUES ((SELECT `id` FROM `puzzle` WHERE `name` LIKE ?), (SELECT `id` FROM `solver` WHERE `name` LIKE ?))";
-    my $c = $dbh->do($sql);
-    if(defined($c)) {
-	debug_log("_get_client_index_db: dbh->do returned $c\n",2);
-	_send_meteor_version();
-	return(1);
-    } else {
-	debug_log("_get_client_index_db: dbh->do returned error: ".$dbh->errstr."\n",0);
-	return(-1);
-    }
+	my $sql = "INSERT INTO `puzzle_solver` (`puzzle_id`, `solver_id`) VALUES ((SELECT `id` FROM `puzzle` WHERE `name` LIKE ?), (SELECT `id` FROM `solver` WHERE `name` LIKE ?))";
+	my $c = $dbh->do($sql,undef,$puzzname,$solver);
+	if(defined($c)) {
+		debug_log("_get_client_index_db: dbh->do returned $c\n",2);
+		_send_data_version();
+		return(1);
+	} else {
+		debug_log("_get_client_index_db: dbh->do returned error: ".$dbh->errstr."\n",0);
+		return(-1);
+	}
 }
 
 
@@ -1351,7 +1509,7 @@ sub _assign_solver_location_db {
     my $c = $dbh->do($sql);
     if(defined($c)) {
 	debug_log("_get_client_index_db: dbh->do returned $c\n",2);
-	_send_meteor_version();
+	_send_data_version();
 	return(1);
     } else {
 	debug_log("_get_client_index_db: dbh->do returned error: ".$dbh->errstr."\n",0);
@@ -1359,54 +1517,6 @@ sub _assign_solver_location_db {
     }
 }
 
-sub get_solver {
-    my $idin = shift;
-    chomp $idin;
-    
-    debug_log("get_puzzle: $idin\n",6);
-
-    if($PB::Config::PB_DATA_READ_DB_OR_FILES eq "FILES") {
-        return _get_solver_files($idin);
-    } else {
-        return _get_solver_db($idin);
-    }
-}
-
-sub _get_solver_files {
-    my $idin = shift;
-    # NOT IMPLEMENTED
-    return {};
-}
-
-sub _get_solver_db {
-    my $idin = shift;
-
-    my $res;
-    my $sql = 'SELECT * FROM `solver_view`';
-    my $sth;
-    if ($idin eq '*') {
-	$sth  = $dbh->prepare($sql);
-	$sth->execute() or die $dbh->errstr;;
-    } else {
-        $sql .= ' WHERE (`id` REGEXP ?)';
-	$sth = $dbh->prepare($sql);
-	$sth->execute('^'.$idin.'$');
-    }
-    my @rows;
-    while ( my $res = $sth->fetchrow_hashref() ) {
-	foreach my $key (keys %{$res}) {
-	    if(!defined($res->{$key})) {
-		$res->{$key} = "";
-	    }
-	}
-	push @rows, $res;
-    }
-    if(@rows > 1) {
-	return \@rows;
-    } else {
-	return \%{$rows[0]};
-    }
-}
 
 ####
 #LOG
@@ -1438,7 +1548,11 @@ sub _get_log_index_db {
     my $res = $dbh->selectcol_arrayref($sql);
     my $version = -1;
     if(defined($res)) {
-        $version = $res->[0];
+	if($res->[0] eq 'null') {
+	    $version = "";
+	} else {
+	    $version = $res->[0];
+	}
     }
     return $version;
 }
@@ -1452,6 +1566,9 @@ sub get_log_diff {
 	$curr_pos = 0;
     }
     chomp($curr_pos);
+    if($curr_pos < $log_pos) {
+	return "from log position ($log_pos) cannot be greater than current (to) log position ($curr_pos)";
+    }
     if($PB::Config::PB_DATA_READ_DB_OR_FILES eq "FILES") {
         return _get_log_diff_files($log_pos, $curr_pos);
     } else {
@@ -1499,11 +1616,12 @@ sub _get_log_diff_files {
 }
 
 sub _get_log_diff_db { 
-    my $from_pos = shift;
+    my $cur_pos = shift;
+	my $from_pos = $cur_pos+1;
     my $to_pos = shift;
     debug_log("_get_log_diff_db: $from_pos - $to_pos\n",6);
     
-    my $sql = "SELECT DISTINCT CONCAT_WS('/', module, name, part) FROM `log` WHERE log.version>= ? AND log.version <= ?";
+    my $sql = "SELECT DISTINCT CONCAT_WS('/', IFNULL(module,''), IFNULL(name,''), IFNULL(part,'')) FROM `log` WHERE log.version>= ? AND log.version <= ?";
     my $res = $dbh->selectcol_arrayref($sql, undef, $from_pos, $to_pos);
     my @changes = @{$res};
     debug_log("_get_log_diff_db: have changes: ".join(',',@changes)."\n", 2);
@@ -1570,11 +1688,12 @@ sub _get_full_log_diff_files {
 }
 
 sub _get_full_log_diff_db { 
-    my $from_pos = shift;
+    my $cur_pos = shift;
+	my $from_pos = $cur_pos+1;
     my $to_pos = shift;
     debug_log("_get_log_diff_db: $from_pos - $to_pos\n",6);
     
-    my $sql = "SELECT CONCAT_WS('/', module, name, part) AS entry, user, time FROM `log` WHERE log.version>= ? AND log.version <= ? ORDER BY id";
+    my $sql = "SELECT CONCAT_WS('/', IFNULL(module,''), IFNULL(name,''), IFNULL(part,'')) AS entry, user, time FROM `log` WHERE log.version>= ? AND log.version <= ? ORDER BY id";
     my $res = $dbh->selectall_arrayref($sql, undef, $from_pos, $to_pos);
     my @entries;
     my @messages;
@@ -1624,6 +1743,10 @@ sub attempt_answer {
 sub _write_log_files {
     my $logitem = shift;
     
+    if($PB::Config::PB_DATA_WRITE_FILES <= 0) {
+	return -1;
+    }
+
     open LOG, ">>$PB::Config::LOG_FILE";
     flock LOG, $EXCLUSIVE_LOCK;
     print LOG "$logitem\n";
@@ -1720,6 +1843,29 @@ sub get_client_index {
       return _get_client_index_db();
   }
 }
+
+###############
+# Data Version
+###############
+sub _send_data_version {
+    my $dataversion = _get_log_index_db();
+    my $ret = 1;
+
+    # Send to bigjimmy bot
+    if(PB::BigJimmy::send_version($dataversion) <= 0) {
+	debug_log("PB::API::_send_data_version() error sending version $dataversion to bigjimmy bot\n",0);
+	$ret = -1;
+    }
+
+    # Send to meteor
+    if(PB::Meteor::message($PB::Config::METEOR_VERSION_CHANNEL, $dataversion) <= 0) {
+	debug_log("PB::API::_send_data_version() error sending version $dataversion over meteor\n",0);
+	$ret = -1;
+    }
+
+    return $ret;
+}
+
 
 
 1;
